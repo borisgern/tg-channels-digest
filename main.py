@@ -5,13 +5,23 @@ import datetime
 import asyncio
 import sqlite3
 from pathlib import Path
+from typing import List
+import openai
+from openai import AsyncOpenAI
 
 # Import configuration
-from config import API_ID, API_HASH, BOT_TOKEN, CHANNEL_USERNAME, DIGEST_INTERVAL_MINUTES
+from config import (
+    API_ID, API_HASH, BOT_TOKEN, CHANNEL_USERNAME, 
+    DIGEST_INTERVAL_MINUTES, OPENAI_API_KEY, GPT_MODEL,
+    SUMMARY_PROMPT_TEMPLATE
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Initialize OpenAI client
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Initialize the Telegram client for the bot
 # We use the bot token for authentication
@@ -124,6 +134,48 @@ def format_digest(posts, is_auto=False):
     
     return digest
 
+async def summarize_posts(posts: List[tuple]) -> str:
+    """Generate an AI summary of the posts using OpenAI's GPT.
+    
+    Args:
+        posts: List of (timestamp, content) tuples
+    
+    Returns:
+        str: AI-generated summary of the posts
+    """
+    if not posts:
+        return ""
+    
+    try:
+        # Format posts for the prompt
+        formatted_posts = "\n\n".join([
+            f"[{datetime.datetime.fromisoformat(timestamp).strftime('%H:%M')}] {content}"
+            for timestamp, content in posts
+        ])
+        
+        # Prepare the prompt using the template
+        prompt = SUMMARY_PROMPT_TEMPLATE.format(posts=formatted_posts)
+        
+        # Call OpenAI API
+        response = await openai_client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes Telegram channel posts."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,  # Add some creativity but keep it focused
+            max_tokens=250    # Limit response length
+        )
+        
+        # Extract and return the summary
+        summary = response.choices[0].message.content.strip()
+        logger.info("Successfully generated AI summary")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error generating AI summary: {e}")
+        return "⚠️ Не удалось создать AI-обзор."
+
 async def send_digest(event=None, hours: int = 2):
     """Send digest to the user.
     
@@ -131,27 +183,51 @@ async def send_digest(event=None, hours: int = 2):
         event: Optional event object for command-triggered digests
         hours: Number of hours to look back for posts
     """
-    # Get recent posts from database
-    posts = get_recent_posts(hours)
+    # Get posts based on whether this is a manual request or automatic digest
+    if event:
+        # For manual digest requests, show all recent posts
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cutoff_time = (datetime.datetime.now() - datetime.timedelta(hours=hours)).isoformat()
+        cursor.execute(
+            'SELECT timestamp, content FROM posts WHERE timestamp > ? ORDER BY timestamp ASC',
+            (cutoff_time,)
+        )
+        posts = cursor.fetchall()
+        conn.close()
+    else:
+        # For automatic digests, only show unsent posts
+        posts = get_recent_posts(hours)
     
     if not posts:
-        if event:  # Only respond if this was triggered by a command
+        if event:
             await event.respond("No posts collected in the last 2 hours. Check back later!")
         return
     
-    # Format the digest (auto=True if no event, meaning it's an automatic digest)
-    digest = format_digest(posts, is_auto=not bool(event))
-    
     try:
-        # If triggered by command, respond to the event
-        # Otherwise, send to the stored user ID
+        # Generate AI summary
+        summary = await summarize_posts(posts)
+        
+        # Format the regular digest
+        digest = format_digest(posts, is_auto=not bool(event))
+        
+        # Combine summary and digest
+        full_message = f"{summary}\n\n{digest}"
+        
+        # Send the combined message
+        if event:
+            await event.respond(full_message)
+        elif hasattr(bot, 'sender_id') and bot.sender_id:
+            await bot.send_message(bot.sender_id, full_message)
+            logger.info(f"Sent digest with AI summary to user {bot.sender_id}")
+    
+    except Exception as e:
+        logger.error(f"Error sending digest: {e}")
+        # If AI summary fails, still try to send the regular digest
         if event:
             await event.respond(digest)
         elif hasattr(bot, 'sender_id') and bot.sender_id:
             await bot.send_message(bot.sender_id, digest)
-            logger.info(f"Sent automatic digest to user {bot.sender_id}")
-    except Exception as e:
-        logger.error(f"Error sending digest: {e}")
 
 async def automatic_digest_task():
     """Background task that sends digest periodically."""
