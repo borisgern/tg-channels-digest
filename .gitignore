@@ -124,3 +124,6 @@ cython_debug/
 .env
 .env.*
 !.env.example
+
+# macOS system files
+.DS_Store

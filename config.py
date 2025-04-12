@@ -10,14 +10,10 @@ API_HASH = os.getenv('TELEGRAM_API_HASH')
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHANNEL_USERNAME = os.getenv('TELEGRAM_CHANNEL_USERNAME')
 
-# Interval in minutes for automatic digest sending
-DIGEST_INTERVAL_MINUTES = 2  # Send digest every hour by default 
-
 # OpenAI Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
 # Choose which GPT model to use for summarization
-# Options: "gpt-3.5-turbo" or "gpt-4"
 GPT_MODEL = "gpt-3.5-turbo"
 
 # Prompt template for post summarization
@@ -33,6 +29,9 @@ SUMMARY_PROMPT_TEMPLATE = """
 🤖 AI-обзор:
 [Твое краткое описание здесь]
 """
+
+# Interval in minutes for automatic digest sending
+DIGEST_INTERVAL_MINUTES = int(os.getenv('DIGEST_INTERVAL_MINUTES', 60)) # Default to 60 minutes if not set
 
 # Validate that all required environment variables are set
 required_env_vars = [
