@@ -9,6 +9,7 @@ import signal
 import sys
 from datetime import datetime, timedelta
 import os
+import re
 
 # Import configuration
 from config import (
@@ -47,7 +48,7 @@ def init_database():
         )
     ''')
     
-    # Create posts table with channel information
+    # Create posts table with channel information and post link
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,13 +56,14 @@ def init_database():
             channel_title TEXT NOT NULL,
             timestamp TEXT NOT NULL,
             content TEXT NOT NULL,
+            post_link TEXT,
             sent BOOLEAN DEFAULT FALSE
         )
     ''')
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized successfully")
+    logger.info("Database initialized successfully (posts table updated with post_link)")
 
 def register_user(user_id: int, username: str = None):
     """Register a new user in the database if not exists.
@@ -113,39 +115,41 @@ def init_posts_database():
     conn.close()
     logger.info("Posts database initialized successfully")
 
-async def save_post(channel_id: str, channel_title: str, timestamp: str, content: str):
-    """Save a post to the database."""
+async def save_post(channel_id: str, channel_title: str, timestamp: str, content: str, post_link: str):
+    """Save a post to the database, including its link."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        'INSERT INTO posts (channel_id, channel_title, timestamp, content, sent) VALUES (?, ?, ?, ?, FALSE)',
-        (channel_id, channel_title, timestamp, content)
+        'INSERT INTO posts (channel_id, channel_title, timestamp, content, post_link, sent) VALUES (?, ?, ?, ?, ?, FALSE)',
+        (channel_id, channel_title, timestamp, content, post_link)
     )
     conn.commit()
     conn.close()
-    logger.info(f"Saved post from channel {channel_title}")
+    logger.info(f"Saved post from {channel_title} with link: {post_link}")
 
 def get_unsent_posts():
-    """Get all unsent posts from the database."""
+    """Get all unsent posts from the database, including their links."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT id, channel_title, timestamp, content 
-            FROM posts 
-            WHERE sent = FALSE 
+            SELECT id, channel_title, timestamp, content, post_link
+            FROM posts
+            WHERE sent = FALSE
             ORDER BY timestamp ASC
         ''')
         posts = cursor.fetchall()
         conn.close()
         
-        # Log the number of unsent posts found
-        logger.info(f"Found {len(posts)} unsent posts")
+        logger.info(f"Found {len(posts)} unsent posts (with links)")
         
         # Log the first few posts for debugging
         if posts:
             for i, post in enumerate(posts[:3]):
-                logger.debug(f"Post {i+1}: ID={post[0]}, Channel={post[1]}, Time={post[2]}")
+                if len(post) >= 5: # Check length before accessing index
+                    logger.debug(f"Post {i+1}: ID={post[0]}, Channel={post[1]}, Time={post[2]}, Link={post[4]}") # Логируем ссылку
+                else:
+                    logger.debug(f"Post {i+1} has unexpected format: {post}")
         
         return posts
     except Exception as e:
@@ -175,7 +179,7 @@ def mark_posts_as_sent(post_ids: list):
         logger.error(f"Error marking posts as sent: {e}")
 
 def get_recent_posts_for_manual_digest(hours=4):
-    """Get posts from the last N hours for manual digest."""
+    """Get posts from the last N hours for manual digest, including links."""
     try:
         # Calculate timestamp for N hours ago
         now = datetime.now()
@@ -185,9 +189,9 @@ def get_recent_posts_for_manual_digest(hours=4):
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT channel_title, timestamp, content
+            SELECT id, channel_title, timestamp, content, post_link
             FROM posts
-            WHERE timestamp > ? AND sent = FALSE
+            WHERE timestamp > ?
             ORDER BY timestamp ASC
         ''', (timestamp_threshold,))
         
@@ -198,12 +202,12 @@ def get_recent_posts_for_manual_digest(hours=4):
         valid_posts = []
         for post in posts:
             try:
-                # Ensure we have exactly 3 values
-                if len(post) != 3:
-                    logger.warning(f"Skipping post with invalid format: {post}")
+                # Ensure we have exactly 5 values
+                if len(post) != 5:
+                    logger.warning(f"Skipping post with invalid format (expected 5): {post}")
                     continue
                     
-                channel_title, timestamp, content = post
+                post_id, channel_title, timestamp, content, post_link = post
                 
                 # Validate timestamp format
                 try:
@@ -217,10 +221,11 @@ def get_recent_posts_for_manual_digest(hours=4):
                 logger.error(f"Error processing post: {e}")
                 continue
                 
+        logger.info(f"Found {len(valid_posts)} posts for manual digest (hours={hours})")
         return valid_posts
         
     except Exception as e:
-        logger.error(f"Error getting recent posts: {e}")
+        logger.error(f"Error getting recent posts for manual digest: {e}")
         return []
 
 def count_unsent_posts():
@@ -280,26 +285,29 @@ async def start_handler(event):
              logger.error(f"Failed to send error message to user_id={user_id}: {resp_err}")
 
 async def format_digest(posts):
-    """Format posts into a readable digest."""
+    """Format posts into a readable digest, including post links."""
     if not posts:
         return "No posts to include in digest."
 
     # Group posts by channel
     channels = {}
     for post in posts:
-        # Unpack all 4 values returned by get_unsent_posts
-        post_id, channel_title, timestamp, content = post
+        # Unpack all 5 values
+        if len(post) != 5:
+             logger.warning(f"Skipping post in format_digest due to invalid format (expected 5): {post}")
+             continue
+        post_id, channel_title, timestamp, content, post_link = post # Добавлена post_link
         if channel_title not in channels:
             channels[channel_title] = []
-        # Store timestamp and content for formatting
-        channels[channel_title].append((timestamp, content))
+        # Store timestamp, content, and link for formatting
+        channels[channel_title].append((timestamp, content, post_link)) # Добавлена post_link
 
-    # Format digest
+    # Format digest - Use single \n for newlines
     digest = "📬 Дайджест неотправленных постов:\n\n"
 
     for channel_title, channel_posts in channels.items():
         digest += f"**Канал {channel_title}**\n"
-        for timestamp, content in channel_posts:
+        for timestamp, content, post_link in channel_posts: # Добавлена post_link
             # Convert ISO timestamp to readable format
             try:
                 dt = datetime.fromisoformat(timestamp)
@@ -307,27 +315,31 @@ async def format_digest(posts):
             except ValueError:
                 time_str = "[invalid time]"
 
-            # Format post content
+            # Format post content with clickable timestamp
             preview = content[:100] + "..." if len(content) > 100 else content
-            digest += f"— [{time_str}] {preview}\n\n"
+            # Добавляем ссылку на время, если она есть
+            time_display = f"[{time_str}]({post_link})" if post_link else f"[{time_str}]"
+            digest += f"— {time_display} {preview}\n\n"
 
     return digest
 
 async def summarize_posts(posts):
-    """Generate a summary of posts using OpenAI."""
+    """Generate a summary of posts using OpenAI, returning summary text and a link map."""
     if not posts:
-        return None
+        logger.info("[summarize_posts] No posts received, returning None, None.")
+        return None, None # Return None for both summary and link map
         
     try:
-        # Format posts for the prompt, with validation
+        # Format posts for the prompt and create link map
         formatted_posts = []
-        for post in posts:
+        link_map = {} # Dictionary to store {index: link}
+        for i, post in enumerate(posts):
             try:
-                if len(post) != 4:  # Теперь ожидаем 4 значения
-                    logger.warning(f"Skipping post with invalid format (expected 4 values): {post}")
+                if len(post) != 5:
+                    logger.warning(f"Skipping post in summarize_posts due to invalid format (expected 5): {post}")
                     continue
-                    
-                post_id, channel_title, timestamp, content = post
+
+                post_id, channel_title, timestamp, content, post_link = post
                 
                 # Validate timestamp
                 try:
@@ -335,20 +347,23 @@ async def summarize_posts(posts):
                 except ValueError:
                     logger.warning(f"Skipping post with invalid timestamp: {timestamp}")
                     continue
-                    
-                formatted_posts.append(f"[{time_str}] [{channel_title}] {content}")
+
+                # Add post number, time, channel, content, and link to the formatted list
+                formatted_posts.append(f"[{i+1}] [{time_str}] [{channel_title}] {content}\n   Link: {post_link}")
+                link_map[i+1] = post_link # Store the link with its number
             except Exception as e:
                 logger.error(f"Error formatting post for summary: {e}")
                 continue
                 
         if not formatted_posts:
-            logger.warning("No valid posts to summarize")
-            return None
+            logger.warning("[summarize_posts] No valid posts to format for prompt, returning None, None.")
+            return None, None
             
         # Join all valid posts
         posts_text = "\n\n".join(formatted_posts)
         
-        # Call OpenAI API with increased max_tokens
+        # Call OpenAI API
+        logger.info(f"[summarize_posts] Calling OpenAI API with {len(formatted_posts)} formatted posts.")
         response = await openai_client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
@@ -356,82 +371,132 @@ async def summarize_posts(posts):
                 {"role": "user", "content": posts_text}
             ],
             temperature=0.7,
-            max_tokens=800  # Увеличено с 250 до 800
+            max_tokens=800
         )
         
         summary = response.choices[0].message.content.strip()
         
-        # Проверяем, что суммаризация не обрезана
+        # --- LOGGING BEFORE RETURN ---
+        logger.info(f"[summarize_posts] OpenAI response received. Summary length: {len(summary) if summary else 0}")
+        logger.info(f"[summarize_posts] Summary snippet: {summary[:200] if summary else 'N/A'} ...")
+        logger.info(f"[summarize_posts] Link map generated: {link_map}")
+        # --- END LOGGING ---
+        
         if summary.endswith('...') or summary.endswith('…'):
             logger.warning("Summary appears to be truncated. Consider increasing max_tokens.")
         
-        return summary
+        return summary, link_map # Return summary text and link map
         
     except Exception as e:
-        logger.error(f"Error generating summary: {e}")
-        return None
+        logger.error(f"[summarize_posts] Error during generation: {e}")
+        return None, None # Return None for both on error
 
 async def send_digest(manual=False):
-    """Send digest to all registered users."""
+    """Generate, format with links, and send digest to all registered users."""
+    generated_summary = None
     try:
-        # Get posts
         posts = get_recent_posts_for_manual_digest() if manual else get_unsent_posts()
-        
         if not posts:
-            return "No posts to include in digest."
-            
-        # Extract post IDs for marking as sent later
-        post_ids = []
-        for post in posts:
-            try:
-                # Check if post has an ID (first element)
-                if len(post) > 0 and isinstance(post[0], int):
-                    post_ids.append(post[0])
-            except Exception as e:
-                logger.error(f"Error extracting post ID: {e}")
-            
-        # Format digest
-        digest = await format_digest(posts)
+            if not manual:
+                logger.info("No new unsent posts for automatic digest.")
+                return None
+            return "Нет постов для дайджеста за последние 4 часа."
+
+        summary, link_map = await summarize_posts(posts)
+        generated_summary = summary
+        if not summary:
+            return "Произошла ошибка при генерации дайджеста."
+
+        # Create the message with Markdown links using string replace
+        final_summary = summary
+        if link_map:
+            logger.info(f"[send_digest] Starting link replacement using string.replace(). Link map size: {len(link_map)}")
+            replacements_made = 0
+            for num in sorted(link_map.keys(), reverse=True): # Iterate reverse to handle [10] before [1]
+                link = link_map[num]
+                # Placeholder to find: e.g., [1]
+                placeholder = f"[{num}]"
+                # Replacement string: e.g., [1](link)
+                markdown_link = f"[{num}]({link})"
+                
+                # Use simple string replacement
+                summary_before_replace = final_summary
+                final_summary = final_summary.replace(placeholder, markdown_link)
+                
+                if summary_before_replace != final_summary:
+                    replacements_made += 1
+                    logger.debug(f"  Replaced '{placeholder}' -> '{markdown_link}'")
+                
+            logger.info(f"[send_digest] Finished link replacement. Replacements made: {replacements_made}")
+        else:
+            logger.debug("[send_digest] Link map is empty or None. Skipping replacement.")
         
-        # Try to get AI summary
-        summary = await summarize_posts(posts)
-        if summary:
-            digest = f"{digest}\n\n{summary}"
-            
         # Send to all users
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM users')
         users = cursor.fetchall()
-        
-        for user_id in users:
-            try:
-                await bot.send_message(user_id[0], digest)
-            except Exception as e:
-                logger.error(f"Failed to send digest to user {user_id[0]}: {e}")
-                
-        # Mark posts as sent if this was an automatic digest
-        if not manual and post_ids:
-            mark_posts_as_sent(post_ids)
-            logger.info(f"Marked {len(post_ids)} posts as sent after manual digest")
-            
         conn.close()
-        return digest
+        sent_to_users = 0
+        if not users:
+             logger.warning("No registered users found to send digest to.")
+        else:
+            for user_id_tuple in users:
+                user_id = user_id_tuple[0]
+                try:
+                    await bot.send_message(user_id, final_summary, parse_mode='markdown', link_preview=False)
+                    sent_to_users += 1
+                except Exception as e:
+                    logger.error(f"Failed to send digest to user {user_id}: {e}")
+        logger.info(f"Sent {'manual' if manual else 'automatic'} digest to {sent_to_users} users.")
         
+        # Mark posts as sent ONLY if automatic digest AND sent to at least one user
+        if not manual and sent_to_users > 0:
+            post_ids = [post[0] for post in posts if len(post) > 0 and isinstance(post[0], int)]
+            if post_ids:
+                mark_posts_as_sent(post_ids)
+                logger.info(f"Marked {len(post_ids)} posts as sent after automatic digest")
+            else:
+                logger.warning("No post IDs found to mark as sent for automatic digest")
+        elif not manual and sent_to_users == 0:
+             logger.warning("Automatic digest was not sent to any users, posts will NOT be marked as sent.")
+        
+        # Return value logic:
+        if manual:
+            if sent_to_users > 0:
+                return final_summary 
+            else:
+                return "Не удалось отправить дайджест ни одному пользователю."
+        else: # Automatic digest
+            return None
+
     except Exception as e:
         logger.error(f"Error sending digest: {e}")
-        return "Error generating digest. Please try again later."
+        return "Произошла ошибка при отправке дайджеста." if manual else None
 
 @bot.on(events.NewMessage(pattern='/digest'))
 async def digest_handler(event):
-    """Handle /digest command - send digest of recent posts."""
+    """Handle /digest command - trigger manual digest generation and send result."""
     try:
-        logger.info(f"Processing /digest command from user {event.sender_id}")
-        digest = await send_digest(manual=True)
-        await event.respond(digest)
+        sender_id = event.sender_id
+        logger.info(f"Processing /digest command from user {sender_id}")
+        
+        # Call send_digest (manual=True) which handles generation, formatting, and sending
+        # It returns the final formatted message or an error/status message
+        result_message = await send_digest(manual=True)
+        
+        # Respond to the user who initiated the command with the result
+        if result_message:
+            await event.respond(result_message, parse_mode='markdown', link_preview=False)
+            logger.info(f"Sent digest/status result to user {sender_id}")
+        else:
+            # Should not happen if send_digest returns a message, but handle just in case
+            await event.respond("Произошла внутренняя ошибка при обработке дайджеста.")
+            logger.error(f"send_digest(manual=True) returned None unexpectedly for user {sender_id}")
+            
     except Exception as e:
         logger.error(f"Error in digest_handler: {e}")
-        await event.respond("Error processing digest command. Please try again later.")
+        await event.respond("Произошла ошибка при обработке команды /digest.")
 
 def get_registered_users():
     """Get all registered user IDs from the database."""
@@ -451,12 +516,13 @@ async def channel_handler(event):
         channel = await event.get_chat()
         channel_id = str(channel.id)
         channel_title = channel.title
-        
+        channel_username = channel.username # Get username for link
+
         # Check if this channel is in our monitored list
-        if not any(channel_id in ch or channel.username in ch for ch in CHANNELS):
-            logger.debug(f"Ignoring message from non-monitored channel: {channel_title}")
+        if not any(channel_id in ch or (channel_username and channel_username in ch) for ch in CHANNELS):
+            logger.debug(f"Ignoring message from non-monitored channel: {channel_title} ({channel_username or channel_id})")
             return
-        
+
         # Get message content
         if event.message.text:
             content = event.message.text
@@ -468,13 +534,17 @@ async def channel_handler(event):
             logger.debug(f"Skipping message without content from {channel_title}")
             return
             
+        # Construct post link
+        message_id = event.message.id
+        post_link = f"https://t.me/{channel_username}/{message_id}" if channel_username else f"https://t.me/c/{channel_id}/{message_id}" # Handle public vs private channels
+
         # Save post to database
         timestamp = event.message.date.isoformat()
-        await save_post(channel_id, channel_title, timestamp, content)
+        await save_post(channel_id, channel_title, timestamp, content, post_link)
         
         # Format notification
         time_str = event.message.date.strftime("%H:%M")
-        notification = f"📥 Новый пост из {channel_title}\n⏰ Время: {time_str}\n📝 Текст: {content[:100]}{'...' if len(content) > 100 else ''}"
+        notification = f"📥 Новый пост из [{channel_title}]({post_link})\n⏰ Время: {time_str}\n📝 Текст: {content[:100]}{'...' if len(content) > 100 else ''}"
         
         # Send notification to all registered users
         conn = sqlite3.connect(DB_PATH)
@@ -485,7 +555,7 @@ async def channel_handler(event):
         
         for user_id in users:
             try:
-                await bot.send_message(user_id[0], notification)
+                await bot.send_message(user_id[0], notification, parse_mode='markdown') # Use markdown for link
             except Exception as e:
                 logger.error(f"Failed to notify user {user_id[0]}: {e}")
                 
@@ -509,61 +579,8 @@ async def automatic_digest_task():
             
             logger.info("Running automatic digest job...")
             
-            # Get unsent posts
-            posts = get_unsent_posts()
-            
-            if not posts:
-                logger.info("No new unsent posts for automatic digest.")
-                continue
-            
-            logger.info(f"Found {len(posts)} unsent posts for digest.")
-            
-            # Extract post IDs for marking as sent later
-            post_ids = []
-            for post in posts:
-                try:
-                    # Check if post has an ID (first element)
-                    if len(post) > 0 and isinstance(post[0], int):
-                        post_ids.append(post[0])
-                except Exception as e:
-                    logger.error(f"Error extracting post ID: {e}")
-            
-            # Generate AI summary
-            summary = await summarize_posts(posts)
-            
-            # Format the regular digest list
-            digest_list = await format_digest(posts)
-            
-            # Combine summary and digest
-            # Ensure summary is not None before adding
-            if summary:
-                full_message = f"{summary}\n\n{digest_list}"
-            else:
-                full_message = digest_list # Send only digest if summary failed
-            
-            # Send the combined message to all registered users
-            sent_to_users = 0
-            registered_users = get_registered_users() # Get users first
-            if not registered_users:
-                logger.warning("No registered users found to send digest to. Skipping sending and marking as sent.")
-            else:
-                for user_id in registered_users:
-                    try:
-                        await bot.send_message(user_id, full_message)
-                        sent_to_users += 1
-                    except Exception as e:
-                        logger.error(f"Failed to send auto-digest to user {user_id}: {e}")
-
-                logger.info(f"Sent automatic digest to {sent_to_users} users.")
-
-                # Mark posts as sent ONLY if sent to at least one user
-                if sent_to_users > 0 and post_ids:
-                    mark_posts_as_sent(post_ids)
-                    logger.info(f"Marked {len(post_ids)} posts as sent after automatic digest")
-                elif not post_ids:
-                    logger.warning("No post IDs found to mark as sent")
-                else: # sent_to_users == 0
-                    logger.warning("Digest was not sent to any users, posts will NOT be marked as sent.")
+            # Просто вызываем send_digest(manual=False), она теперь сама все делает
+            await send_digest(manual=False)
 
         except asyncio.CancelledError:
             logger.info("Automatic digest task cancelled.")
