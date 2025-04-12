@@ -7,3 +7,6 @@ BOT_TOKEN = '8007265051:AAHckSZrFaRPcs1nu2nfNqLXQ4vZWyAs1dU'  # Replace with you
 
 # Username of the public channel to monitor (without '@')
 CHANNEL_USERNAME = 'baligern' # Replace with the target channel username 
+
+# Interval in minutes for automatic digest sending
+DIGEST_INTERVAL_MINUTES = 1  # Send digest every hour by default 
