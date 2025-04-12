@@ -7,10 +7,11 @@ import sqlite3
 from pathlib import Path
 import signal
 import sys
+from datetime import datetime, timedelta
 
 # Import configuration
 from config import (
-    API_ID, API_HASH, BOT_TOKEN, CHANNEL_USERNAME,
+    API_ID, API_HASH, BOT_TOKEN, CHANNELS,
     OPENAI_API_KEY, GPT_MODEL, SUMMARY_PROMPT_TEMPLATE,
     DIGEST_INTERVAL_MINUTES # Import interval
 )
@@ -23,11 +24,10 @@ logger = logging.getLogger(__name__)
 openai_client = openai.AsyncClient(api_key=OPENAI_API_KEY)
 
 # Database setup
-DB_PATH = 'users.db'
-POSTS_DB_PATH = 'posts.db'
+DB_PATH = 'digest.db'  # Use a single database file
 
 def init_database():
-    """Initialize SQLite database and create users table if it doesn't exist."""
+    """Initialize SQLite database and create necessary tables if they don't exist."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -36,8 +36,19 @@ def init_database():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            first_seen TEXT NOT NULL,
-            digest_time TEXT
+            first_seen TEXT
+        )
+    ''')
+    
+    # Create posts table with channel information
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            channel_title TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            content TEXT NOT NULL,
+            sent BOOLEAN DEFAULT FALSE
         )
     ''')
     
@@ -78,7 +89,7 @@ def register_user(user_id: int, username: str = None):
 
 def init_posts_database():
     """Initialize SQLite database for posts and create table if it doesn't exist."""
-    conn = sqlite3.connect(POSTS_DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     # Create posts table with sent flag
@@ -95,34 +106,28 @@ def init_posts_database():
     conn.close()
     logger.info("Posts database initialized successfully")
 
-def save_post_to_db(timestamp: str, content: str):
-    """Save a new post to the posts database.
-    
-    Args:
-        timestamp: ISO format timestamp
-        content: Post content/text
-    """
-    conn = sqlite3.connect(POSTS_DB_PATH)
+async def save_post(channel_id: str, channel_title: str, timestamp: str, content: str):
+    """Save a post to the database."""
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
     cursor.execute(
-        'INSERT INTO posts (timestamp, content) VALUES (?, ?)',
-        (timestamp, content)
+        'INSERT INTO posts (channel_id, channel_title, timestamp, content, sent) VALUES (?, ?, ?, ?, FALSE)',
+        (channel_id, channel_title, timestamp, content)
     )
-    
     conn.commit()
     conn.close()
-    logger.info(f"Saved new post to DB with timestamp {timestamp}")
+    logger.info(f"Saved post from channel {channel_title}")
 
 def get_unsent_posts():
-    """Get unsent posts from the database."""
-    conn = sqlite3.connect(POSTS_DB_PATH)
+    """Get all unsent posts from the database."""
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Select unsent posts
-    cursor.execute(
-        'SELECT id, timestamp, content FROM posts WHERE sent = FALSE ORDER BY timestamp ASC'
-    )
+    cursor.execute('''
+        SELECT id, channel_title, timestamp, content 
+        FROM posts 
+        WHERE sent = FALSE 
+        ORDER BY timestamp ASC
+    ''')
     posts = cursor.fetchall()
     conn.close()
     return posts
@@ -132,7 +137,7 @@ def mark_posts_as_sent(post_ids: list):
     if not post_ids:
         return
     
-    conn = sqlite3.connect(POSTS_DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     placeholders = ', '.join('?' * len(post_ids))
@@ -146,25 +151,29 @@ def mark_posts_as_sent(post_ids: list):
     logger.info(f"Marked {len(post_ids)} posts as sent")
 
 def get_recent_posts_for_manual_digest(hours: int = 4):
-    """Get posts from the last N hours for manual /digest command."""
-    conn = sqlite3.connect(POSTS_DB_PATH)
+    """Get posts from the last N hours for manual digest."""
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Calculate cutoff time
-    cutoff_time = (datetime.datetime.now() - datetime.timedelta(hours=hours)).isoformat()
+    # Calculate timestamp for N hours ago
+    now = datetime.now()
+    hours_ago = now - timedelta(hours=hours)
+    timestamp_threshold = hours_ago.isoformat()
     
-    # Select posts regardless of sent status
-    cursor.execute(
-        'SELECT timestamp, content FROM posts WHERE timestamp > ? ORDER BY timestamp ASC',
-        (cutoff_time,)
-    )
+    cursor.execute('''
+        SELECT channel_title, timestamp, content
+        FROM posts
+        WHERE timestamp > ?
+        ORDER BY timestamp ASC
+    ''', (timestamp_threshold,))
+    
     posts = cursor.fetchall()
     conn.close()
     return posts
 
 def count_unsent_posts():
     """Get count of unsent posts from the database."""
-    conn = sqlite3.connect(POSTS_DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM posts WHERE sent = FALSE')
     count = cursor.fetchone()[0]
@@ -203,110 +212,114 @@ async def start_handler(event):
     
     await event.respond(welcome_msg)
 
-async def format_posts(posts, is_auto=False):
-    """Format posts into a readable list.
-    
-    Args:
-        posts: List of (timestamp, content) or (id, timestamp, content) tuples
-        is_auto: Boolean indicating if this is an automatic digest
-        
-    Returns:
-        str: Formatted digest list
-    """
-    header = "📬 Автодайджест:" if is_auto else "📬 Дайджест постов за последние 4 часа:"
-    digest_list = f"{header}\n"
-    
-    for post_data in posts:
-        # Handle different tuple structures
-        if len(post_data) == 3: # (id, timestamp, content)
-            _, timestamp, content = post_data
-        elif len(post_data) == 2: # (timestamp, content)
-            timestamp, content = post_data
-        else:
-            continue # Skip invalid data
-        
-        # Convert ISO timestamp to time only
-        try:
-            time_str = datetime.datetime.fromisoformat(timestamp).strftime("%H:%M")
-        except ValueError:
-            time_str = "??:??" # Handle potential malformed timestamp
-            
-        # Get the first line of the content as a summary
-        text = content.split('\n')[0] if content else "[Медиа-сообщение]"
-        digest_list += f"— [{time_str}] {text}\n"
-    
-    return digest_list
-
-async def generate_ai_summary(posts):
-    """Generate an AI summary of the posts using OpenAI."""
+async def format_digest(posts):
+    """Format posts into a readable digest."""
     if not posts:
-        return ""
+        return "No posts to include in digest."
+        
+    # Group posts by channel
+    channels = {}
+    for channel_title, timestamp, content in posts:
+        if channel_title not in channels:
+            channels[channel_title] = []
+        channels[channel_title].append((timestamp, content))
     
+    # Format digest
+    digest = "📬 Дайджест постов за последние 4 часа:\n\n"
+    
+    for channel_title, channel_posts in channels.items():
+        for timestamp, content in channel_posts:
+            # Convert ISO timestamp to readable format
+            dt = datetime.fromisoformat(timestamp)
+            time_str = dt.strftime("%H:%M")
+            
+            # Format post content
+            preview = content[:100] + "..." if len(content) > 100 else content
+            digest += f"— [{time_str}] {preview}\n\n"
+            
+    return digest
+
+async def summarize_posts(posts):
+    """Generate a summary of posts using OpenAI."""
+    if not posts:
+        return None
+        
     try:
-        # Format posts for the prompt, handling different tuple structures
+        # Format posts for the prompt
         formatted_posts = "\n\n".join([
-            f"[{datetime.datetime.fromisoformat(p[1]).strftime('%H:%M')}] {p[2]}" if len(p) == 3 else 
-            f"[{datetime.datetime.fromisoformat(p[0]).strftime('%H:%M')}] {p[1]}" 
+            f"[{datetime.fromisoformat(p[1]).strftime('%H:%M')}] {p[2]}" 
             for p in posts if len(p) >= 2
         ])
-        
-        # Prepare the prompt
-        prompt = SUMMARY_PROMPT_TEMPLATE.format(posts=formatted_posts)
         
         # Call OpenAI API
         response = await openai_client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes Telegram channel posts."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": SUMMARY_PROMPT_TEMPLATE},
+                {"role": "user", "content": formatted_posts}
             ],
             temperature=0.7,
             max_tokens=250
         )
         
-        # Extract and return the summary
         summary = response.choices[0].message.content.strip()
-        logger.info("Successfully generated AI summary")
-        return summary
+        return f"🤖 AI-обзор:\n{summary}"
         
     except Exception as e:
-        logger.error(f"Error generating AI summary: {e}")
-        return "⚠️ Не удалось создать AI-обзор."
+        logger.error(f"Error generating summary: {e}")
+        return None
+
+async def send_digest(manual=False):
+    """Send digest to all registered users."""
+    try:
+        # Get posts
+        posts = get_recent_posts_for_manual_digest() if manual else get_unsent_posts()
+        
+        if not posts:
+            return "No posts to include in digest."
+            
+        # Format digest
+        digest = await format_digest(posts)
+        
+        # Try to get AI summary
+        summary = await summarize_posts(posts)
+        if summary:
+            digest = f"{digest}\n\n{summary}"
+            
+        # Send to all users
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users')
+        users = cursor.fetchall()
+        
+        for user_id in users:
+            try:
+                await bot.send_message(user_id[0], digest)
+            except Exception as e:
+                logger.error(f"Failed to send digest to user {user_id[0]}: {e}")
+                
+        # Mark posts as sent if this was an automatic digest
+        if not manual:
+            cursor.execute('UPDATE posts SET sent = TRUE WHERE sent = FALSE')
+            conn.commit()
+            
+        conn.close()
+        return digest
+        
+    except Exception as e:
+        logger.error(f"Error sending digest: {e}")
+        return "Error generating digest. Please try again later."
 
 @bot.on(events.NewMessage(pattern='/digest'))
 async def digest_handler(event):
-    """Handle the /digest command - send posts from last 4 hours"""
-    
-    posts = get_recent_posts_for_manual_digest(hours=4)
-    
-    if not posts:
-        await event.respond('📭 Нет постов за последние 4 часа.')
-        return
-
+    """Handle /digest command - send digest of recent posts."""
     try:
-        # Generate AI summary
-        summary = await generate_ai_summary(posts)
-        
-        # Format the digest list
-        digest_list = await format_posts(posts, is_auto=False)
-
-        # Combine summary and digest
-        full_message = f"{summary}\n\n{digest_list}"
-        
-        # Send the combined message
-        await event.respond(full_message)
-        
-        logger.info("Manual digest sent")
-        
+        logger.info(f"Processing /digest command from user {event.sender_id}")
+        digest = await send_digest(manual=True)
+        await event.respond(digest)
     except Exception as e:
-        logger.error(f"Error sending manual digest: {e}")
-        # Fallback: Send only the list if summary fails
-        try:
-            digest_list = await format_posts(posts, is_auto=False)
-            await event.respond(digest_list)
-        except Exception as e2:
-            logger.error(f"Failed to send fallback digest list: {e2}")
-            await event.respond("Произошла ошибка при формировании дайджеста.")
+        logger.error(f"Error in digest_handler: {e}")
+        await event.respond("Error processing digest command. Please try again later.")
 
 def get_registered_users():
     """Get all registered user IDs from the database."""
@@ -317,39 +330,54 @@ def get_registered_users():
     conn.close()
     return users
 
-@user_client.on(events.NewMessage(chats=CHANNEL_USERNAME))
+@user_client.on(events.NewMessage(chats=CHANNELS))
 async def channel_handler(event):
-    """Handle new messages from the channel and save to DB"""
-    # Get message details
-    timestamp = event.message.date.isoformat() # Use message date
-    content = event.message.text or "[Медиа-сообщение]"
-    message_id = event.message.id
-    
-    # Save post to database
-    save_post_to_db(timestamp, content)
-    
-    # Prepare notification message for users
-    time_str = event.message.date.strftime("%H:%M")
-    text = content.split('\n')[0] if content else "[Медиа-сообщение]"
-    if len(text) > 100:
-        text = text[:100] + "..."
-    
-    notification = f"📥 Новый пост из @{CHANNEL_USERNAME}\n"
-    notification += f"⏰ Время: {time_str}\n"
-    notification += f"📝 Текст: {text}\n"
-    if event.message.media:
-        notification += f"📎 Тип медиа: {event.message.media.__class__.__name__}\n"
-    # notification += f"\nВсего постов в кэше: {len(post_cache)}" # Remove cache count
-    
-    # Send notification to all registered users
-    for user_id in get_registered_users():
-        try:
-            await bot.send_message(user_id, notification)
-        except Exception as e:
-            logger.error(f"Failed to send notification to user {user_id}: {e}")
-    
-    # Log to console
-    logger.info(f"New post (ID: {message_id}) saved to DB")
+    """Handle new messages from monitored channels."""
+    try:
+        # Get channel info
+        channel = await event.get_chat()
+        channel_id = str(channel.id)
+        channel_title = channel.title
+        
+        # Check if this channel is in our monitored list
+        if not any(channel_id in ch or channel.username in ch for ch in CHANNELS):
+            logger.debug(f"Ignoring message from non-monitored channel: {channel_title}")
+            return
+        
+        # Get message content
+        if event.message.text:
+            content = event.message.text
+        elif event.message.media:
+            content = "[Media message]"
+            if hasattr(event.message.media, 'caption') and event.message.media.caption:
+                content += f": {event.message.media.caption}"
+        else:
+            logger.debug(f"Skipping message without content from {channel_title}")
+            return
+            
+        # Save post to database
+        timestamp = event.message.date.isoformat()
+        await save_post(channel_id, channel_title, timestamp, content)
+        
+        # Format notification
+        time_str = event.message.date.strftime("%H:%M")
+        notification = f"📥 Новый пост из {channel_title}\n⏰ Время: {time_str}\n📝 Текст: {content[:100]}{'...' if len(content) > 100 else ''}"
+        
+        # Send notification to all registered users
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users')
+        users = cursor.fetchall()
+        conn.close()
+        
+        for user_id in users:
+            try:
+                await bot.send_message(user_id[0], notification)
+            except Exception as e:
+                logger.error(f"Failed to notify user {user_id[0]}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error in channel_handler: {e}")
 
 async def automatic_digest_task():
     """Background task that sends digest periodically."""
@@ -372,10 +400,10 @@ async def automatic_digest_task():
             logger.info(f"Found {len(posts)} unsent posts for digest.")
             
             # Generate AI summary
-            summary = await generate_ai_summary(posts)
+            summary = await summarize_posts(posts)
             
             # Format the regular digest list
-            digest_list = await format_posts(posts, is_auto=True)
+            digest_list = await format_digest(posts)
             
             # Combine summary and digest
             full_message = f"{summary}\n\n{digest_list}"
@@ -416,39 +444,60 @@ async def shutdown(signal, loop):
 
 @bot.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
-    """Handle the /status command - show statistics about pending posts"""
+    """Handle /status command - show statistics about unsent posts by channel."""
     try:
-        # Get count of unsent posts
-        post_count, earliest_timestamp = count_unsent_posts()
+        # Calculate timestamp for 4 hours ago
+        now = datetime.now()
+        hours_ago = now - timedelta(hours=4)
+        timestamp_threshold = hours_ago.isoformat()
         
-        if post_count == 0:
-            await event.respond('📊 Статус:\n— Нет новых постов для следующего дайджеста')
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT channel_title, COUNT(*) as post_count
+            FROM posts
+            WHERE timestamp > ? AND sent = FALSE
+            GROUP BY channel_title
+        ''', (timestamp_threshold,))
+        
+        stats = cursor.fetchall()
+        
+        # Get the earliest unsent post
+        cursor.execute('''
+            SELECT timestamp
+            FROM posts
+            WHERE sent = FALSE
+            ORDER BY timestamp ASC
+            LIMIT 1
+        ''')
+        earliest_post = cursor.fetchone()
+        
+        conn.close()
+        
+        if not stats:
+            await event.respond("📊 Статус:\n— Постов готово к отправке: 0\n\nСледующий автодайджест примерно через 60 минут")
             return
+            
+        # Count total posts
+        total_posts = sum(count for _, count in stats)
         
-        # Format message
-        status = "📊 Статус:\n"
-        status += f"— Постов готово к отправке: {post_count}\n"
+        # Format earliest post time
+        earliest_time = "Нет постов"
+        if earliest_post:
+            earliest_time = datetime.fromisoformat(earliest_post[0]).strftime("%H:%M")
         
-        # Add info about earliest post if available
-        if earliest_timestamp:
-            try:
-                earliest_time = datetime.datetime.fromisoformat(earliest_timestamp)
-                time_str = earliest_time.strftime("%H:%M")
-                status += f"— Первый пост от: {time_str}\n"
-            except ValueError:
-                pass
-        
-        # Add info about next digest
-        next_digest = datetime.datetime.now() + datetime.timedelta(minutes=DIGEST_INTERVAL_MINUTES)
+        # Calculate next digest time
+        next_digest = now + timedelta(minutes=DIGEST_INTERVAL_MINUTES)
         next_digest_str = next_digest.strftime("%H:%M")
-        status += f"\nСледующий автодайджест примерно в {next_digest_str}"
         
-        await event.respond(status)
-        logger.info("Status info sent")
+        response = f"📊 Статус:\n— Постов готово к отправке: {total_posts}\n— Первый пост от: {earliest_time}\n\nСледующий автодайджест примерно в {next_digest_str}"
+            
+        logger.info(f"Sending status response: {response}")
+        await event.respond(response)
         
     except Exception as e:
-        logger.error(f"Error sending status: {e}")
-        await event.respond("❌ Произошла ошибка при получении статуса.")
+        logger.error(f"Error in status_handler: {e}")
+        await event.respond("Error getting status. Please try again later.")
 
 async def main():
     """Start the bot and user client"""
