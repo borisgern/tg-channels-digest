@@ -3,4 +3,7 @@
 
 # Python cache
 __pycache__/
-*.pyc 
+*.pyc
+
+# Virtual environment
+venv/ 
