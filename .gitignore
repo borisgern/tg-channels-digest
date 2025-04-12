@@ -1,0 +1,6 @@
+# Telethon session files
+*.session
+
+# Python cache
+__pycache__/
+*.pyc 
