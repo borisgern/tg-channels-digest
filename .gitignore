@@ -119,3 +119,8 @@ cython_debug/
 
 # SQLite database
 *.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
