@@ -29,34 +29,44 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 #GPT_MODEL = "gpt-3.5-turbo"
 GPT_MODEL = "gpt-4o-mini"
 # Prompt template for post summarization
-SUMMARY_PROMPT_TEMPLATE = """
-You are an AI assistant generating a smart digest of posts from various Telegram channels. The channels may cover different topic (e.g., AI, education, news, memes), and your task is to help the user quickly understand what's important.
+SUMMARY_PROMPT_TEMPLATE = """You are an assistant that creates structured digests of posts from Telegram channels.
 
-Here's what you need to do:
-1. Group the posts by topic (if the same topic is mentioned across multiple channels -- make that explicit).
-2. For each topic, write a short summary (1--3 sentences) with the core insight or message.
-3. Avoid repetition -- if multiple posts talk about the same event, just mention that it was discussed in several channels.
-4. Add short references like [1], [2], etc., for each post -- these will link back to the original messages.
-5. Write clearly and concisely in Russian, with an emphasis on usefulness.
+The user will provide a list of posts. Each post includes:
+1. A number in square brackets [N] for reference.
+2. Publication time.
+3. Channel title.
+4. Message content.
+5. A link to the original post.
 
-Posts:
-{posts}
+Your task:
+1. Analyze the provided posts.
+2. Group related posts into thematic sections.
+3. Write a brief summary (1-3 sentences) for each section.
+4. **IMPORTANT: The entire response MUST be in Russian.**
+5. Use the post numbers [N] as references within the summary text.
+6. If there are any jokes, memes, or notably informal content, put them in a final section titled "\U0001F3AD Интересное". If there's none, state: "Развлекательного контента в постах не найдено".
 
 Output format:
-🧠 AI Digest:
+\U0001F9E0 Дайджест:
 
-**📌 Topic 1: [Title or key fact]**  
-Short explanation of the insight. [1], [3]
+\U0001F4CC Тема 1: [Название темы]
+[Краткое описание темы на русском, объединяющее связанные посты. Используй номера постов [N] для ссылок.]
 
-**📌 Topic 2: ...**  
-...
+\U0001F4CC Тема 2: [Название темы]
+[Краткое описание второй темы на русском с ссылками [N].]
 
-If there are memes, jokes, or light-hearted content, include them at the end under a separate section like:  
-🎭 **Fun & Informal**
+\U0001F3AD Интересное
+[Забавные моменты или мемы на русском. [N]]
 
-If there's nothing meaningful to say -- don't invent content. It's better to be brief and relevant than verbose and vague.
+Rules:
+1. Write ONLY in Russian.
+2. Keep the digest concise but informative.
+3. Always use the bracketed numbers [N] to refer to posts.
+4. Do not invent information not present in the posts.
+5. Use emojis as shown in the format.
 
-"""
+Posts to process:
+{posts}"""
 
 # Interval in minutes for automatic digest sending
 raw_interval = os.getenv('DIGEST_INTERVAL_MINUTES')
