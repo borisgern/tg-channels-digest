@@ -323,10 +323,11 @@ async def summarize_posts(posts):
         formatted_posts = []
         for post in posts:
             try:
-                if len(post) != 3:
+                if len(post) != 4:  # Теперь ожидаем 4 значения
+                    logger.warning(f"Skipping post with invalid format (expected 4 values): {post}")
                     continue
                     
-                channel_title, timestamp, content = post
+                post_id, channel_title, timestamp, content = post
                 
                 # Validate timestamp
                 try:
@@ -335,7 +336,7 @@ async def summarize_posts(posts):
                     logger.warning(f"Skipping post with invalid timestamp: {timestamp}")
                     continue
                     
-                formatted_posts.append(f"[{time_str}] {content}")
+                formatted_posts.append(f"[{time_str}] [{channel_title}] {content}")
             except Exception as e:
                 logger.error(f"Error formatting post for summary: {e}")
                 continue
@@ -347,7 +348,7 @@ async def summarize_posts(posts):
         # Join all valid posts
         posts_text = "\n\n".join(formatted_posts)
         
-        # Call OpenAI API
+        # Call OpenAI API with increased max_tokens
         response = await openai_client.chat.completions.create(
             model=GPT_MODEL,
             messages=[
@@ -355,11 +356,16 @@ async def summarize_posts(posts):
                 {"role": "user", "content": posts_text}
             ],
             temperature=0.7,
-            max_tokens=250
+            max_tokens=800  # Увеличено с 250 до 800
         )
         
         summary = response.choices[0].message.content.strip()
-        return f"🤖 AI-обзор:\n{summary}"
+        
+        # Проверяем, что суммаризация не обрезана
+        if summary.endswith('...') or summary.endswith('…'):
+            logger.warning("Summary appears to be truncated. Consider increasing max_tokens.")
+        
+        return summary
         
     except Exception as e:
         logger.error(f"Error generating summary: {e}")
