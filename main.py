@@ -10,20 +10,19 @@ import sys
 from datetime import datetime, timedelta
 import os
 import re
+import pytz
+import telethon.errors
 
 # Import configuration
 from config import (
     API_ID, API_HASH, BOT_TOKEN, CHANNELS,
     OPENAI_API_KEY, GPT_MODEL, SUMMARY_PROMPT_TEMPLATE,
-    DIGEST_INTERVAL_MINUTES # Import interval
+    DIGEST_TIME,
 )
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Log imported configuration - This should now be the definitive value
-logger.info(f"Using DIGEST_INTERVAL_MINUTES from config: {DIGEST_INTERVAL_MINUTES} minutes")
 
 # Debug: Print all environment variables
 logger.info(f"Environment variables after import: {dict(os.environ)}")
@@ -287,41 +286,67 @@ async def start_handler(event):
 async def format_digest(posts):
     """Format posts into a readable digest, including post links."""
     if not posts:
-        return "No posts to include in digest."
+        return "Нет постов для включения в дайджест."
 
     # Group posts by channel
     channels = {}
     for post in posts:
-        # Unpack all 5 values
         if len(post) != 5:
-             logger.warning(f"Skipping post in format_digest due to invalid format (expected 5): {post}")
-             continue
-        post_id, channel_title, timestamp, content, post_link = post # Добавлена post_link
+            logger.warning(f"Skipping post in format_digest due to invalid format (expected 5): {post}")
+            continue
+        post_id, channel_title, timestamp, content, post_link = post
         if channel_title not in channels:
             channels[channel_title] = []
-        # Store timestamp, content, and link for formatting
-        channels[channel_title].append((timestamp, content, post_link)) # Добавлена post_link
+        channels[channel_title].append((timestamp, content, post_link))
 
-    # Format digest - Use single \n for newlines
-    digest = "📬 Дайджест неотправленных постов:\n\n"
+    # Format digest
+    digest = "🧠 Дайджест:\n\n"
+
+    # Group posts by topic (you can implement more sophisticated grouping later)
+    topics = {}
+    topic_counter = 1
 
     for channel_title, channel_posts in channels.items():
-        digest += f"**Канал {channel_title}**\n"
-        for timestamp, content, post_link in channel_posts: # Добавлена post_link
-            # Convert ISO timestamp to readable format
+        topic_name = f"Новые посты из {channel_title}"
+        topics[topic_name] = channel_posts
+
+    for topic_name, topic_posts in topics.items():
+        # Add topic header
+        digest += f"📌 Тема {topic_counter}: {topic_name}\n"
+        
+        # Add posts under this topic
+        for timestamp, content, post_link in topic_posts:
             try:
                 dt = datetime.fromisoformat(timestamp)
                 time_str = dt.strftime("%H:%M")
             except ValueError:
                 time_str = "[invalid time]"
 
-            # Format post content with clickable timestamp
-            preview = content[:100] + "..." if len(content) > 100 else content
-            # Добавляем ссылку на время, если она есть
-            time_display = f"[{time_str}]({post_link})" if post_link else f"[{time_str}]"
-            digest += f"— {time_display} {preview}\n\n"
+            # Format post content with clickable link
+            preview = content[:200] + "..." if len(content) > 200 else content
+            if post_link:
+                digest += f"• [{time_str}]({post_link}): {preview}\n"
+            else:
+                digest += f"• {time_str}: {preview}\n"
+        
+        digest += "\n"
+        topic_counter += 1
+
+    # Add entertainment section
+    digest += "🎭 Интересное\n"
+    digest += "Развлекательного контента в постах не найдено.\n"
 
     return digest
+
+def has_entertainment_content(posts):
+    """Check if there's any entertainment content in the posts."""
+    # Add your logic to detect entertainment content
+    return False
+
+def format_entertainment_content(posts):
+    """Format the entertainment content section."""
+    # Add your logic to format entertainment content
+    return "Развлекательного контента в постах не найдено."
 
 async def summarize_posts(posts):
     """Generate a summary of posts using OpenAI, returning summary text and a link map."""
@@ -371,7 +396,7 @@ async def summarize_posts(posts):
                 {"role": "user", "content": posts_text}
             ],
             temperature=0.7,
-            max_tokens=800
+            max_tokens=3000
         )
         
         summary = response.choices[0].message.content.strip()
@@ -391,9 +416,13 @@ async def summarize_posts(posts):
         logger.error(f"[summarize_posts] Error during generation: {e}")
         return None, None # Return None for both on error
 
-async def send_digest(manual=False):
-    """Generate, format with links, and send digest to all registered users."""
-    generated_summary = None
+async def send_digest(manual=False, target_user_id=None):
+    """Generate, format with links, and send digest.
+    
+    Args:
+        manual (bool): If True, get recent posts instead of unsent.
+        target_user_id (int, optional): If provided and manual=True, send only to this user.
+    """
     try:
         posts = get_recent_posts_for_manual_digest() if manual else get_unsent_posts()
         if not posts:
@@ -403,100 +432,161 @@ async def send_digest(manual=False):
             return "Нет постов для дайджеста за последние 4 часа."
 
         summary, link_map = await summarize_posts(posts)
-        generated_summary = summary
         if not summary:
+            logger.error("[send_digest] Failed to generate summary.")
             return "Произошла ошибка при генерации дайджеста."
 
-        # Create the message with Markdown links using string replace
+        # Create the message with Markdown links
         final_summary = summary
         if link_map:
             logger.info(f"[send_digest] Starting link replacement using string.replace(). Link map size: {len(link_map)}")
             replacements_made = 0
-            for num in sorted(link_map.keys(), reverse=True): # Iterate reverse to handle [10] before [1]
+            for num in sorted(link_map.keys(), reverse=True):
                 link = link_map[num]
-                # Placeholder to find: e.g., [1]
                 placeholder = f"[{num}]"
-                # Replacement string: e.g., [1](link)
                 markdown_link = f"[{num}]({link})"
-                
-                # Use simple string replacement
                 summary_before_replace = final_summary
                 final_summary = final_summary.replace(placeholder, markdown_link)
-                
                 if summary_before_replace != final_summary:
                     replacements_made += 1
                     logger.debug(f"  Replaced '{placeholder}' -> '{markdown_link}'")
-                
             logger.info(f"[send_digest] Finished link replacement. Replacements made: {replacements_made}")
         else:
             logger.debug("[send_digest] Link map is empty or None. Skipping replacement.")
-        
-        # Send to all users
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM users')
-        users = cursor.fetchall()
-        conn.close()
-        sent_to_users = 0
-        if not users:
-             logger.warning("No registered users found to send digest to.")
+
+        # Determine recipients
+        recipient_ids = []
+        if manual and target_user_id:
+            recipient_ids = [target_user_id]
+            logger.info(f"[send_digest] Manual digest requested. Sending only to user {target_user_id}")
+        elif not manual:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM users')
+            recipient_ids = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            logger.info(f"[send_digest] Automatic digest. Sending to {len(recipient_ids)} registered users.")
+        else: # Manual digest without target_user_id (should not happen from /digest command)
+             logger.warning("[send_digest] Manual digest called without target_user_id. Sending to all users.")
+             conn = sqlite3.connect(DB_PATH)
+             cursor = conn.cursor()
+             cursor.execute('SELECT user_id FROM users')
+             recipient_ids = [row[0] for row in cursor.fetchall()]
+             conn.close()
+
+        # Send to recipients
+        sent_to_count = 0
+        if not recipient_ids:
+            logger.warning("No recipients found for digest.")
         else:
-            for user_id_tuple in users:
-                user_id = user_id_tuple[0]
+            for user_id in recipient_ids:
                 try:
                     await bot.send_message(user_id, final_summary, parse_mode='markdown', link_preview=False)
-                    sent_to_users += 1
+                    sent_to_count += 1
                 except Exception as e:
                     logger.error(f"Failed to send digest to user {user_id}: {e}")
-        logger.info(f"Sent {'manual' if manual else 'automatic'} digest to {sent_to_users} users.")
+        logger.info(f"Sent {'manual' if manual else 'automatic'} digest to {sent_to_count} users.")
         
-        # Mark posts as sent ONLY if automatic digest AND sent to at least one user
-        if not manual and sent_to_users > 0:
+        # Mark posts as sent ONLY for automatic digest if sent successfully
+        if not manual and sent_to_count > 0:
             post_ids = [post[0] for post in posts if len(post) > 0 and isinstance(post[0], int)]
             if post_ids:
                 mark_posts_as_sent(post_ids)
                 logger.info(f"Marked {len(post_ids)} posts as sent after automatic digest")
             else:
                 logger.warning("No post IDs found to mark as sent for automatic digest")
-        elif not manual and sent_to_users == 0:
+        elif not manual and sent_to_count == 0:
              logger.warning("Automatic digest was not sent to any users, posts will NOT be marked as sent.")
         
-        # Return value logic:
+        # Return the generated summary only if it was a manual request 
+        # (even if sending failed, the text was still generated)
         if manual:
-            if sent_to_users > 0:
-                return final_summary 
-            else:
-                return "Не удалось отправить дайджест ни одному пользователю."
-        else: # Automatic digest
+            return final_summary
+        else: # Automatic digest doesn't need to return the text
             return None
 
     except Exception as e:
-        logger.error(f"Error sending digest: {e}")
+        logger.error(f"Error in send_digest: {e}", exc_info=True)
+        # Return an error message for manual requests, None for automatic
         return "Произошла ошибка при отправке дайджеста." if manual else None
 
 @bot.on(events.NewMessage(pattern='/digest'))
 async def digest_handler(event):
-    """Handle /digest command - trigger manual digest generation and send result."""
+    """Handle /digest command - trigger manual digest generation and send result ONLY to the requester."""
+    sender_id = None
+    status_message = None  # Keep track of the "Generating..." message
     try:
         sender_id = event.sender_id
         logger.info(f"Processing /digest command from user {sender_id}")
-        
-        # Call send_digest (manual=True) which handles generation, formatting, and sending
-        # It returns the final formatted message or an error/status message
-        result_message = await send_digest(manual=True)
-        
-        # Respond to the user who initiated the command with the result
-        if result_message:
-            await event.respond(result_message, parse_mode='markdown', link_preview=False)
-            logger.info(f"Sent digest/status result to user {sender_id}")
+
+        # Send a quick confirmation and store the message object
+        status_message = await event.respond("⏳ Генерирую дайджест за последние 4 часа...")
+
+        # Call send_digest
+        result_message = await send_digest(manual=True, target_user_id=sender_id)
+
+        # Case 1: Digest generated and sent successfully by send_digest
+        # Check if result_message is not None and not an error message
+        if result_message and not (result_message.startswith("Нет постов") or result_message.startswith("Произошла ошибка")):
+            logger.info(f"Digest sent successfully to user {sender_id} by send_digest.")
+            # Delete the "Generating..." message as the digest is already sent
+            try:
+                await status_message.delete()
+                logger.info(f"Deleted status message for user {sender_id}.")
+            except Exception as del_err:
+                logger.error(f"Could not delete status message for user {sender_id}: {del_err}")
+
+        # Case 2: No posts or error during generation/sending
+        elif result_message: # Contains "Нет постов..." or "Произошла ошибка..."
+            logger.info(f"Handling status/error message for user {sender_id}: {result_message}")
+            try:
+                # Try editing the status message
+                await status_message.edit(result_message)
+                logger.info(f"Edited status message for user {sender_id}.")
+            except telethon.errors.rpcerrorlist.MessageIdInvalidError:
+                logger.warning(f"Failed to edit status message for user {sender_id} (MessageIdInvalidError). Sending new message.")
+                # If editing fails, delete the old one (if possible) and send a new one
+                try:
+                    await status_message.delete()
+                except Exception as del_err:
+                     logger.error(f"Could not delete status message after edit failed for user {sender_id}: {del_err}")
+                await event.respond(result_message) # Send the error as a new message
+            except Exception as edit_err:
+                logger.error(f"Failed to edit status message for user {sender_id}: {edit_err}. Sending new message.")
+                # Fallback for other edit errors
+                try:
+                    await status_message.delete()
+                except Exception as del_err:
+                     logger.error(f"Could not delete status message after edit failed for user {sender_id}: {del_err}")
+                await event.respond(result_message)
+
+        # Case 3: Unexpected None result from send_digest(manual=True)
         else:
-            # Should not happen if send_digest returns a message, but handle just in case
-            await event.respond("Произошла внутренняя ошибка при обработке дайджеста.")
             logger.error(f"send_digest(manual=True) returned None unexpectedly for user {sender_id}")
-            
+            error_text = "Произошла внутренняя ошибка при обработке дайджеста."
+            try:
+                await status_message.edit(error_text)
+            except Exception: # Handle potential edit failure again
+                 logger.warning(f"Failed to edit status message for unexpected None result for user {sender_id}. Sending new message.")
+                 try:
+                    await status_message.delete()
+                 except Exception: pass
+                 await event.respond(error_text)
+
     except Exception as e:
-        logger.error(f"Error in digest_handler: {e}")
-        await event.respond("Произошла ошибка при обработке команды /digest.")
+        logger.error(f"Error in digest_handler for user {sender_id}: {e}", exc_info=True)
+        try:
+            # Try to inform the user about the error, preferably by editing the status message if it exists
+            error_text = "Произошла ошибка при обработке команды /digest."
+            if status_message:
+                try:
+                    await status_message.edit(error_text)
+                except Exception:
+                    await event.respond(error_text) # Fallback to new message
+            else:
+                 await event.respond(error_text)
+        except Exception as resp_err:
+             logger.error(f"Failed to send final error message to user {sender_id}: {resp_err}")
 
 def get_registered_users():
     """Get all registered user IDs from the database."""
@@ -562,32 +652,67 @@ async def channel_handler(event):
     except Exception as e:
         logger.error(f"Error in channel_handler: {e}")
 
+async def get_next_run_time():
+    """Calculate the next run time based on DIGEST_TIME (Europe/Lisbon)."""
+    try:
+        tz = pytz.timezone('Europe/Lisbon')
+        now_tz = datetime.now(tz)
+        
+        # Parse configured time
+        hour, minute = map(int, DIGEST_TIME.split(':'))
+        target_time = datetime.min.replace(hour=hour, minute=minute)
+        
+        # Calculate next run time
+        next_run_dt_tz = tz.localize(datetime.combine(now_tz.date(), target_time.time()))
+        
+        # If the target time has already passed today, schedule for tomorrow
+        if now_tz >= next_run_dt_tz:
+            next_run_dt_tz += timedelta(days=1)
+        
+        logger.info(f"Current time (Europe/Lisbon): {now_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
+        logger.info(f"Next digest run time (Europe/Lisbon): {next_run_dt_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')}")
+        
+        return next_run_dt_tz
+    except Exception as e:
+        logger.error(f"Error calculating next run time: {e}")
+        raise
+
 async def automatic_digest_task():
-    """Background task that sends digest periodically."""
-    logger.info(f"Starting automatic digest task (interval: {DIGEST_INTERVAL_MINUTES} minutes)")
-    logger.info(f"Using DIGEST_INTERVAL_MINUTES from config: {DIGEST_INTERVAL_MINUTES}")
-    
-    # Debug: Print all environment variables
-    logger.info(f"Environment variables: {dict(os.environ)}")
+    """Background task that sends digest daily at 00:00 Europe/Lisbon."""
+    logger.info("Starting automatic digest task (scheduled for 00:00 Europe/Lisbon)")
     
     while True:
         try:
-            # Wait for the specified interval using the value directly from config
-            current_interval = DIGEST_INTERVAL_MINUTES
-            logger.info(f"Waiting for {current_interval} minutes before next digest")
-            await asyncio.sleep(current_interval * 60)
+            # Calculate the next run time
+            next_run_time_tz = await get_next_run_time()
+            now_utc = datetime.now(pytz.utc) # Use timezone-aware datetime
             
+            # Convert next run time to UTC for comparison and sleep calculation
+            next_run_time_utc = next_run_time_tz.astimezone(pytz.utc)
+            
+            wait_seconds = (next_run_time_utc - now_utc).total_seconds()
+            
+            if wait_seconds > 0:
+                logger.info(f"Waiting for {wait_seconds:.2f} seconds until next scheduled digest ({next_run_time_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')})...")
+                await asyncio.sleep(wait_seconds)
+            else:
+                # If calculated time is in the past (e.g., due to startup delay), run immediately and schedule for next day
+                logger.warning(f"Calculated next run time {next_run_time_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')} is in the past. Running now and rescheduling.")
+                # Optional: add a small delay to prevent rapid looping if there's an issue
+                await asyncio.sleep(5)
+                
             logger.info("Running automatic digest job...")
             
-            # Просто вызываем send_digest(manual=False), она теперь сама все делает
+            # Call send_digest (handles getting posts, summarizing, sending, marking as sent)
             await send_digest(manual=False)
 
         except asyncio.CancelledError:
             logger.info("Automatic digest task cancelled.")
             break
         except Exception as e:
-            logger.error(f"Error in automatic digest task: {e}")
-            # Wait a bit before retrying in case of error
+            logger.error(f"Error in automatic digest task: {e}", exc_info=True)
+            # Wait a bit before retrying in case of error to avoid tight loop
+            logger.info("Waiting 60 seconds before retrying digest task after error.")
             await asyncio.sleep(60)
 
 async def shutdown(signal, loop):
@@ -662,8 +787,13 @@ async def status_handler(event):
         else:
              response += "\nНет неотправленных постов за последние 4 часа.\n"
 
-        # Add next digest info
-        response += f"\nСледующий автодайджест примерно через {DIGEST_INTERVAL_MINUTES} минут"
+        # Add next scheduled run time
+        try:
+            next_run_dt_tz = await get_next_run_time()
+            response += f"\nСледующий автодайджест: {next_run_dt_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')}"
+        except Exception as e:
+            logger.error(f"Error getting next run time for status: {e}")
+            response += "\nНе удалось определить время следующего автодайджеста."
 
         await event.respond(response)
         
@@ -692,7 +822,6 @@ async def main():
     await user_client.start()
     
     logger.info("Bot started successfully")
-    logger.info(f"Using DIGEST_INTERVAL_MINUTES: {DIGEST_INTERVAL_MINUTES} minutes")
     
     # Start the automatic digest task
     auto_digest_task = asyncio.create_task(automatic_digest_task())
