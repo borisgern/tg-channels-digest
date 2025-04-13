@@ -12,6 +12,7 @@ import os
 import re
 import pytz
 import telethon.errors
+from functools import partial
 
 # Import configuration
 from config import (
@@ -468,34 +469,25 @@ async def send_digest(manual=False, target_user_id=None):
         # Return an error message for manual requests, None for automatic
         return "Произошла ошибка при отправке дайджеста." if manual else None
 
-@bot.on(events.NewMessage(pattern='/start'))
+# --- Handler Definitions (NO DECORATORS) --- 
+
 async def start_handler(event):
     """Handle the /start command and register new users"""
     sender = None
     user_id = None
     username = None
     try:
-        # Get sender info
         sender = await event.get_sender()
         user_id = sender.id
         username = sender.username
         logger.info(f"Received /start command from user_id={user_id}, username={username}")
-
-        # Try to register user
         logger.info(f"Attempting to register user {user_id}...")
         is_new_user = register_user(user_id, username)
         logger.info(f"register_user returned: {is_new_user} for user_id={user_id}")
-
         welcome_msg = '👋 Привет! Ты зарегистрирован. ' if is_new_user else '👋 Привет! Ты уже был зарегистрирован. '
-        welcome_msg += '''Я буду сохранять сообщения и отправлять их дайджестом.
-
-Доступные команды:
-/digest - получить дайджест за последние 4 часа
-/status - узнать количество постов для следующего дайджеста'''
-
+        welcome_msg += '''Я буду сохранять сообщения и отправлять их дайджестом.\n\nДоступные команды:\n/digest - получить дайджест за последние 4 часа\n/status - узнать количество постов для следующего дайджеста'''
         await event.respond(welcome_msg)
         logger.info(f"Sent welcome message to user_id={user_id}")
-
     except Exception as e:
         logger.error(f"Error in start_handler for user_id={user_id}: {e}", exc_info=True)
         try:
@@ -503,110 +495,122 @@ async def start_handler(event):
         except Exception as resp_err:
              logger.error(f"Failed to send error message to user_id={user_id}: {resp_err}")
 
-@bot.on(events.NewMessage(pattern='/digest'))
 async def digest_handler(event):
     """Handle /digest command - trigger manual digest generation and send result ONLY to the requester."""
     sender_id = None
-    status_message = None  # Keep track of the "Generating..." message
+    status_message = None
     try:
         sender_id = event.sender_id
         logger.info(f"Processing /digest command from user {sender_id}")
-
-        # Send a quick confirmation and store the message object
         status_message = await event.respond("⏳ Генерирую дайджест за последние 4 часа...")
-
-        # Call send_digest
         result_message = await send_digest(manual=True, target_user_id=sender_id)
-
-        # Case 1: Digest generated and sent successfully by send_digest
-        # Check if result_message is not None and not an error message
         if result_message and not (result_message.startswith("Нет постов") or result_message.startswith("Произошла ошибка")):
             logger.info(f"Digest sent successfully to user {sender_id} by send_digest.")
-            # Delete the "Generating..." message as the digest is already sent
             try:
                 await status_message.delete()
                 logger.info(f"Deleted status message for user {sender_id}.")
             except Exception as del_err:
                 logger.error(f"Could not delete status message for user {sender_id}: {del_err}")
-
-        # Case 2: No posts or error during generation/sending
-        elif result_message: # Contains "Нет постов..." or "Произошла ошибка..."
+        elif result_message:
             logger.info(f"Handling status/error message for user {sender_id}: {result_message}")
             try:
-                # Try editing the status message
                 await status_message.edit(result_message)
                 logger.info(f"Edited status message for user {sender_id}.")
             except telethon.errors.rpcerrorlist.MessageIdInvalidError:
                 logger.warning(f"Failed to edit status message for user {sender_id} (MessageIdInvalidError). Sending new message.")
-                # If editing fails, delete the old one (if possible) and send a new one
-                try:
-                    await status_message.delete()
-                except Exception as del_err:
-                     logger.error(f"Could not delete status message after edit failed for user {sender_id}: {del_err}")
-                await event.respond(result_message) # Send the error as a new message
-            except Exception as edit_err:
-                logger.error(f"Failed to edit status message for user {sender_id}: {edit_err}. Sending new message.")
-                # Fallback for other edit errors
                 try:
                     await status_message.delete()
                 except Exception as del_err:
                      logger.error(f"Could not delete status message after edit failed for user {sender_id}: {del_err}")
                 await event.respond(result_message)
-
-        # Case 3: Unexpected None result from send_digest(manual=True)
+            except Exception as edit_err:
+                logger.error(f"Failed to edit status message for user {sender_id}: {edit_err}. Sending new message.")
+                try:
+                    await status_message.delete()
+                except Exception as del_err:
+                     logger.error(f"Could not delete status message after edit failed for user {sender_id}: {del_err}")
+                await event.respond(result_message)
         else:
             logger.error(f"send_digest(manual=True) returned None unexpectedly for user {sender_id}")
             error_text = "Произошла внутренняя ошибка при обработке дайджеста."
             try:
                 await status_message.edit(error_text)
-            except Exception: # Handle potential edit failure again
+            except Exception:
                  logger.warning(f"Failed to edit status message for unexpected None result for user {sender_id}. Sending new message.")
                  try:
                     await status_message.delete()
                  except Exception: pass
                  await event.respond(error_text)
-
     except Exception as e:
         logger.error(f"Error in digest_handler for user {sender_id}: {e}", exc_info=True)
         try:
-            # Try to inform the user about the error, preferably by editing the status message if it exists
             error_text = "Произошла ошибка при обработке команды /digest."
             if status_message:
                 try:
                     await status_message.edit(error_text)
                 except Exception:
-                    await event.respond(error_text) # Fallback to new message
+                    await event.respond(error_text)
             else:
                  await event.respond(error_text)
         except Exception as resp_err:
              logger.error(f"Failed to send final error message to user {sender_id}: {resp_err}")
 
-def get_registered_users():
-    """Get all registered user IDs from the database."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users')
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    logger.info(f"get_registered_users: Found {len(users)} users: {users}")
-    return users
+async def status_handler(event):
+    """Handle /status command - show statistics about unsent posts by channel."""
+    try:
+        now = datetime.now()
+        hours_ago = now - timedelta(hours=4)
+        timestamp_threshold = hours_ago.isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''SELECT channel_title, COUNT(*) as post_count FROM posts WHERE timestamp > ? AND sent = FALSE GROUP BY channel_title''', (timestamp_threshold,))
+        stats = cursor.fetchall()
+        cursor.execute('''SELECT timestamp FROM posts WHERE sent = FALSE ORDER BY timestamp ASC LIMIT 1''')
+        earliest_post = cursor.fetchone()
+        cursor.execute('SELECT COUNT(*) FROM posts WHERE sent = FALSE')
+        total_unsent_count = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM users')
+        registered_user_count = cursor.fetchone()[0]
+        conn.close()
+        response = f"📊 Статус:\n"
+        response += f"— Зарегистрировано пользователей: {registered_user_count}\n"
+        response += f"— Всего неотправленных постов: {total_unsent_count}\n"
+        if not earliest_post:
+            response += "— Самый ранний пост: Нет неотправленных постов\n"
+        else:
+            try:
+                earliest_dt = datetime.fromisoformat(earliest_post[0])
+                earliest_time = earliest_dt.strftime("%Y-%m-%d %H:%M")
+                response += f"— Самый ранний пост: {earliest_time}\n"
+            except ValueError:
+                response += "— Самый ранний пост: Неверный формат времени\n"
+        if stats:
+            response += "\nПо каналам (неотправленные за 4 часа):\n"
+            for title, count in stats:
+                response += f"  - {title}: {count} постов\n"
+        else:
+             response += "\nНет неотправленных постов за последние 4 часа.\n"
+        try:
+            next_run_dt_tz = await get_next_run_time()
+            response += f"\nСледующий автодайджест: {next_run_dt_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')}"
+        except Exception as e:
+            logger.error(f"Error getting next run time for status: {e}")
+            response += "\nНе удалось определить время следующего автодайджеста."
+        await event.respond(response)
+    except Exception as e:
+        logger.error(f"Error in status_handler: {e}")
+        await event.respond("Произошла ошибка при получении статуса.")
 
-@user_client.on(events.NewMessage(chats=CHANNELS))
-async def channel_handler(event):
+async def channel_handler(event, bot):
     """Handle new messages from monitored channels."""
     try:
-        # Get channel info
         channel = await event.get_chat()
         channel_id = str(channel.id)
         channel_title = channel.title
-        channel_username = channel.username # Get username for link
-
-        # Check if this channel is in our monitored list
+        channel_username = channel.username
         if not any(channel_id in ch or (channel_username and channel_username in ch) for ch in CHANNELS):
             logger.debug(f"Ignoring message from non-monitored channel: {channel_title} ({channel_username or channel_id})")
             return
-
-        # Get message content
         if event.message.text:
             content = event.message.text
         elif event.message.media:
@@ -616,32 +620,22 @@ async def channel_handler(event):
         else:
             logger.debug(f"Skipping message without content from {channel_title}")
             return
-            
-        # Construct post link
         message_id = event.message.id
-        post_link = f"https://t.me/{channel_username}/{message_id}" if channel_username else f"https://t.me/c/{channel_id}/{message_id}" # Handle public vs private channels
-
-        # Save post to database
+        post_link = f"https://t.me/{channel_username}/{message_id}" if channel_username else f"https://t.me/c/{channel_id}/{message_id}"
         timestamp = event.message.date.isoformat()
         await save_post(channel_id, channel_title, timestamp, content, post_link)
-        
-        # Format notification
         time_str = event.message.date.strftime("%H:%M")
         notification = f"📥 Новый пост из [{channel_title}]({post_link})\n⏰ Время: {time_str}\n📝 Текст: {content[:100]}{'...' if len(content) > 100 else ''}"
-        
-        # Send notification to all registered users
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute('SELECT user_id FROM users')
         users = cursor.fetchall()
         conn.close()
-        
-        for user_id in users:
+        for user_id_tuple in users:
             try:
-                await bot.send_message(user_id[0], notification, parse_mode='markdown') # Use markdown for link
+                await bot.send_message(user_id_tuple[0], notification, parse_mode='markdown') 
             except Exception as e:
-                logger.error(f"Failed to notify user {user_id[0]}: {e}")
-                
+                logger.error(f"Failed to notify user {user_id_tuple[0]}: {e}")
     except Exception as e:
         logger.error(f"Error in channel_handler: {e}")
 
@@ -721,15 +715,6 @@ async def main():
     bot = TelegramClient('bot_session', API_ID, API_HASH)
     user_client = TelegramClient('user_session', API_ID, API_HASH)
     
-    # Handle shutdown gracefully
-    # --- Pass clients to shutdown if needed, but current shutdown seems to handle tasks globally ---
-    # loop = asyncio.get_event_loop()
-    # signals = (signal.SIGTERM, signal.SIGINT)
-    # for s in signals:
-    #     loop.add_signal_handler(
-    #         s, lambda s=s: asyncio.create_task(shutdown(s, loop, bot, user_client)) # Pass clients if needed
-    #     )
-    
     # --- Start clients --- 
     try:
         logger.info("Starting bot client...")
@@ -742,17 +727,24 @@ async def main():
         
     except Exception as e:
         logger.error(f"Error starting Telegram clients: {e}", exc_info=True)
-        # Decide if we should exit or try to continue if one client fails
         return # Exit if clients fail to start
 
     logger.info("All clients started successfully")
+
+    # --- REGISTER HANDLERS MANUALLY --- 
+    bot.add_event_handler(start_handler, events.NewMessage(pattern='/start'))
+    bot.add_event_handler(digest_handler, events.NewMessage(pattern='/digest'))
+    bot.add_event_handler(status_handler, events.NewMessage(pattern='/status'))
+    user_client.add_event_handler(
+        partial(channel_handler, bot=bot), 
+        events.NewMessage(chats=CHANNELS)
+    )
+    logger.info("Event handlers registered successfully.")
     
     # Start the automatic digest task
     auto_digest_task = asyncio.create_task(automatic_digest_task())
     
-    # --- Setup signal handlers after clients are potentially connected ---
-    # It might be better to register signals before starting potentially long operations
-    # but let's try registering them here first. asyncio.run handles basic SIGINT/SIGTERM.
+    # --- Setup signal handlers (as before) ---
     loop = asyncio.get_running_loop()
     signals_to_handle = (signal.SIGTERM, signal.SIGINT)
     
@@ -798,26 +790,12 @@ async def main():
 
     try:
         logger.info("Running clients until disconnected...")
-        # Run clients and background task
-        # We don't necessarily need to gather the clients' run_until_disconnected
-        # if the shutdown handler correctly disconnects them.
-        # Let's gather the main task and rely on shutdown for cleanup.
         await auto_digest_task
-        # If auto_digest_task finishes unexpectedly, the program might exit.
-        # Consider how to keep it running or what the desired behavior is.
-        # For now, let's assume it runs indefinitely until cancelled.
-        
-        # Alternative: Keep clients running explicitly
-        # await asyncio.gather(\
-        #     bot.run_until_disconnected(), \
-        #     user_client.run_until_disconnected(),\
-        #     auto_digest_task # Add task to gather\
-        # )
         
     except asyncio.CancelledError:
          logger.info("Main task or clients were cancelled. Shutting down...")
     finally:
-         logger.info("Main execution block finished. Cleanup should have happened in shutdown handler.")
+         logger.info("Main execution block finished. Cleanup should have happened...")
          # Ensure clients are disconnected even if shutdown handler had issues
          if bot.is_connected():
              logger.warning("Bot still connected in finally block, attempting disconnect.")
@@ -831,17 +809,6 @@ if __name__ == '__main__':
     try:
         # Debug: Print all environment variables
         logger.info(f"Environment variables before main: {dict(os.environ)}")
-        
-        # --- Use asyncio.run for simpler event loop management ---
-        # Get the event loop
-        # loop = asyncio.get_event_loop()
-
-        # Set up signal handlers
-        # signals_to_handle = (signal.SIGTERM, signal.SIGINT)
-        # for s in signals_to_handle:
-        #     loop.add_signal_handler(\
-        #         s, lambda s=s: asyncio.create_task(shutdown(s, loop))
-        #     )
         
         # Run the main coroutine using asyncio.run
         asyncio.run(main()) # This handles loop creation and closing
