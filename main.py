@@ -846,12 +846,24 @@ if __name__ == '__main__':
         # Debug: Print all environment variables
         logger.info(f"Environment variables before main: {dict(os.environ)}")
         
-        # Run the main function
-        user_client.loop.run_until_complete(main())
+        # --- Use asyncio.run for simpler event loop management ---
+        # Get the event loop
+        # loop = asyncio.get_event_loop()
+
+        # Set up signal handlers
+        # signals_to_handle = (signal.SIGTERM, signal.SIGINT)
+        # for s in signals_to_handle:
+        #     loop.add_signal_handler(
+        #         s, lambda s=s: asyncio.create_task(shutdown(s, loop))
+        #     )
+        
+        # Run the main coroutine using asyncio.run
+        asyncio.run(main()) # This handles loop creation and closing
+
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, shutting down...")
+        logger.info("Received keyboard interrupt, shutting down (handled by asyncio.run or signal handlers)...")
     except Exception as e:
-        logger.error(f"Error running bot: {e}")
-    finally:
-        user_client.loop.close()
-        logger.info("Successfully shutdown the bot") 
+        logger.error(f"Error running bot: {e}", exc_info=True) # Log traceback
+    # finally:
+        # No need for explicit loop.close() when using asyncio.run
+        # logger.info("Successfully shutdown the bot") 
