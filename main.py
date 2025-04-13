@@ -241,48 +241,6 @@ def count_unsent_posts():
     conn.close()
     return count, earliest_timestamp
 
-# Initialize the Telegram clients
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
-user_client = TelegramClient('user_session', API_ID, API_HASH)
-
-# In-memory post cache (no longer used for primary storage)
-# post_cache = [] 
-
-@bot.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
-    """Handle the /start command and register new users"""
-    sender = None
-    user_id = None
-    username = None
-    try:
-        # Get sender info
-        sender = await event.get_sender()
-        user_id = sender.id
-        username = sender.username
-        logger.info(f"Received /start command from user_id={user_id}, username={username}")
-
-        # Try to register user
-        logger.info(f"Attempting to register user {user_id}...")
-        is_new_user = register_user(user_id, username)
-        logger.info(f"register_user returned: {is_new_user} for user_id={user_id}")
-
-        welcome_msg = '👋 Привет! Ты зарегистрирован. ' if is_new_user else '👋 Привет! Ты уже был зарегистрирован. '
-        welcome_msg += '''Я буду сохранять сообщения и отправлять их дайджестом.
-
-Доступные команды:
-/digest - получить дайджест за последние 4 часа
-/status - узнать количество постов для следующего дайджеста'''
-
-        await event.respond(welcome_msg)
-        logger.info(f"Sent welcome message to user_id={user_id}")
-
-    except Exception as e:
-        logger.error(f"Error in start_handler for user_id={user_id}: {e}", exc_info=True)
-        try:
-            await event.respond("Произошла ошибка при обработке команды /start.")
-        except Exception as resp_err:
-             logger.error(f"Failed to send error message to user_id={user_id}: {resp_err}")
-
 async def format_digest(posts):
     """Format posts into a readable digest, including post links."""
     if not posts:
@@ -510,6 +468,41 @@ async def send_digest(manual=False, target_user_id=None):
         # Return an error message for manual requests, None for automatic
         return "Произошла ошибка при отправке дайджеста." if manual else None
 
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_handler(event):
+    """Handle the /start command and register new users"""
+    sender = None
+    user_id = None
+    username = None
+    try:
+        # Get sender info
+        sender = await event.get_sender()
+        user_id = sender.id
+        username = sender.username
+        logger.info(f"Received /start command from user_id={user_id}, username={username}")
+
+        # Try to register user
+        logger.info(f"Attempting to register user {user_id}...")
+        is_new_user = register_user(user_id, username)
+        logger.info(f"register_user returned: {is_new_user} for user_id={user_id}")
+
+        welcome_msg = '👋 Привет! Ты зарегистрирован. ' if is_new_user else '👋 Привет! Ты уже был зарегистрирован. '
+        welcome_msg += '''Я буду сохранять сообщения и отправлять их дайджестом.
+
+Доступные команды:
+/digest - получить дайджест за последние 4 часа
+/status - узнать количество постов для следующего дайджеста'''
+
+        await event.respond(welcome_msg)
+        logger.info(f"Sent welcome message to user_id={user_id}")
+
+    except Exception as e:
+        logger.error(f"Error in start_handler for user_id={user_id}: {e}", exc_info=True)
+        try:
+            await event.respond("Произошла ошибка при обработке команды /start.")
+        except Exception as resp_err:
+             logger.error(f"Failed to send error message to user_id={user_id}: {resp_err}")
+
 @bot.on(events.NewMessage(pattern='/digest'))
 async def digest_handler(event):
     """Handle /digest command - trigger manual digest generation and send result ONLY to the requester."""
@@ -715,92 +708,6 @@ async def automatic_digest_task():
             logger.info("Waiting 60 seconds before retrying digest task after error.")
             await asyncio.sleep(60)
 
-async def shutdown(signal, loop):
-    """Cleanup tasks tied to the service's shutdown."""
-    logger.info(f"Received exit signal {signal.name}...")
-    
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [task.cancel() for task in tasks]
-    
-    logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-    await asyncio.gather(*tasks, return_exceptions=True)
-    loop.stop()
-
-@bot.on(events.NewMessage(pattern='/status'))
-async def status_handler(event):
-    """Handle /status command - show statistics about unsent posts by channel."""
-    try:
-        # Calculate timestamp for 4 hours ago
-        now = datetime.now()
-        hours_ago = now - timedelta(hours=4)
-        timestamp_threshold = hours_ago.isoformat()
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT channel_title, COUNT(*) as post_count
-            FROM posts
-            WHERE timestamp > ? AND sent = FALSE
-            GROUP BY channel_title
-        ''', (timestamp_threshold,))
-        stats = cursor.fetchall()
-        
-        # Get the earliest unsent post
-        cursor.execute('''
-            SELECT timestamp
-            FROM posts
-            WHERE sent = FALSE
-            ORDER BY timestamp ASC
-            LIMIT 1
-        ''')
-        earliest_post = cursor.fetchone()
-        
-        # Get total unsent count
-        cursor.execute('SELECT COUNT(*) FROM posts WHERE sent = FALSE')
-        total_unsent_count = cursor.fetchone()[0]
-        
-        # Get registered user count
-        cursor.execute('SELECT COUNT(*) FROM users')
-        registered_user_count = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        # Fix formatting with \\n for newlines
-        response = f"📊 Статус:\n"
-        response += f"— Зарегистрировано пользователей: {registered_user_count}\n"
-        response += f"— Всего неотправленных постов: {total_unsent_count}\n"
-
-        if not earliest_post:
-            response += "— Самый ранний пост: Нет неотправленных постов\n"
-        else:
-            try:
-                earliest_dt = datetime.fromisoformat(earliest_post[0])
-                earliest_time = earliest_dt.strftime("%Y-%m-%d %H:%M")
-                response += f"— Самый ранний пост: {earliest_time}\n"
-            except ValueError:
-                response += "— Самый ранний пост: Неверный формат времени\n"
-
-        if stats:
-            response += "\nПо каналам (неотправленные за 4 часа):\n"
-            for title, count in stats:
-                response += f"  - {title}: {count} постов\n"
-        else:
-             response += "\nНет неотправленных постов за последние 4 часа.\n"
-
-        # Add next scheduled run time
-        try:
-            next_run_dt_tz = await get_next_run_time()
-            response += f"\nСледующий автодайджест: {next_run_dt_tz.strftime('%Y-%m-%d %H:%M:%S %Z%z')}"
-        except Exception as e:
-            logger.error(f"Error getting next run time for status: {e}")
-            response += "\nНе удалось определить время следующего автодайджеста."
-
-        await event.respond(response)
-        
-    except Exception as e:
-        logger.error(f"Error in status_handler: {e}")
-        await event.respond("Произошла ошибка при получении статуса.")
-
 async def main():
     """Start the bot and user client"""
     # Initialize databases
@@ -810,36 +717,115 @@ async def main():
     # Debug: Print all environment variables
     logger.info(f"Environment variables in main: {dict(os.environ)}")
     
+    # --- INITIALIZE CLIENTS INSIDE MAIN --- 
+    bot = TelegramClient('bot_session', API_ID, API_HASH)
+    user_client = TelegramClient('user_session', API_ID, API_HASH)
+    
     # Handle shutdown gracefully
-    loop = asyncio.get_event_loop()
-    signals = (signal.SIGTERM, signal.SIGINT)
-    for s in signals:
-        loop.add_signal_handler(
-            s, lambda s=s: asyncio.create_task(shutdown(s, loop))
-        )
+    # --- Pass clients to shutdown if needed, but current shutdown seems to handle tasks globally ---
+    # loop = asyncio.get_event_loop()
+    # signals = (signal.SIGTERM, signal.SIGINT)
+    # for s in signals:
+    #     loop.add_signal_handler(
+    #         s, lambda s=s: asyncio.create_task(shutdown(s, loop, bot, user_client)) # Pass clients if needed
+    #     )
     
-    await bot.start()
-    await user_client.start()
-    
-    logger.info("Bot started successfully")
+    # --- Start clients --- 
+    try:
+        logger.info("Starting bot client...")
+        await bot.start(bot_token=BOT_TOKEN)
+        logger.info("Bot client started.")
+        
+        logger.info("Starting user client...")
+        await user_client.start()
+        logger.info("User client started.")
+        
+    except Exception as e:
+        logger.error(f"Error starting Telegram clients: {e}", exc_info=True)
+        # Decide if we should exit or try to continue if one client fails
+        return # Exit if clients fail to start
+
+    logger.info("All clients started successfully")
     
     # Start the automatic digest task
     auto_digest_task = asyncio.create_task(automatic_digest_task())
     
-    try:
-        # Run clients and background task
-        await asyncio.gather(
-            bot.run_until_disconnected(), 
-            user_client.run_until_disconnected(),
-            auto_digest_task # Add task to gather
-        )
-    finally:
-        # Cleanup
+    # --- Setup signal handlers after clients are potentially connected ---
+    # It might be better to register signals before starting potentially long operations
+    # but let's try registering them here first. asyncio.run handles basic SIGINT/SIGTERM.
+    loop = asyncio.get_running_loop()
+    signals_to_handle = (signal.SIGTERM, signal.SIGINT)
+    
+    async def shutdown_wrapper(sig):
+        logger.info(f"Received signal {sig.name}. Initiating shutdown...")
+        # Cancel the digest task first
         if not auto_digest_task.done():
-             auto_digest_task.cancel()
-        await bot.disconnect()
-        await user_client.disconnect()
-        logger.info("Bot stopped gracefully")
+            auto_digest_task.cancel()
+            try:
+                await auto_digest_task
+            except asyncio.CancelledError:
+                 logger.info("Automatic digest task cancelled successfully.")
+            except Exception as e_cancel:
+                 logger.error(f"Error during digest task cancellation: {e_cancel}")
+
+        # Disconnect clients
+        logger.info("Disconnecting clients...")
+        if bot.is_connected():
+            await bot.disconnect()
+        if user_client.is_connected():
+            await user_client.disconnect()
+        logger.info("Clients disconnected.")
+        
+        # Cancel remaining tasks (should ideally be fewer now)
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} remaining outstanding tasks...")
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("Remaining tasks cancelled.")
+        else:
+             logger.info("No remaining tasks to cancel.")
+            
+    for s in signals_to_handle:
+        try:
+            loop.add_signal_handler(
+                 s, lambda s=s: asyncio.create_task(shutdown_wrapper(s))
+            )
+            logger.info(f"Registered signal handler for {s.name}")
+        except NotImplementedError:
+             logger.warning(f"Signal handling for {s.name} not supported on this platform (e.g., Windows). Relying on KeyboardInterrupt.")
+
+    try:
+        logger.info("Running clients until disconnected...")
+        # Run clients and background task
+        # We don't necessarily need to gather the clients' run_until_disconnected
+        # if the shutdown handler correctly disconnects them.
+        # Let's gather the main task and rely on shutdown for cleanup.
+        await auto_digest_task
+        # If auto_digest_task finishes unexpectedly, the program might exit.
+        # Consider how to keep it running or what the desired behavior is.
+        # For now, let's assume it runs indefinitely until cancelled.
+        
+        # Alternative: Keep clients running explicitly
+        # await asyncio.gather(\
+        #     bot.run_until_disconnected(), \
+        #     user_client.run_until_disconnected(),\
+        #     auto_digest_task # Add task to gather\
+        # )
+        
+    except asyncio.CancelledError:
+         logger.info("Main task or clients were cancelled. Shutting down...")
+    finally:
+         logger.info("Main execution block finished. Cleanup should have happened in shutdown handler.")
+         # Ensure clients are disconnected even if shutdown handler had issues
+         if bot.is_connected():
+             logger.warning("Bot still connected in finally block, attempting disconnect.")
+             await bot.disconnect()
+         if user_client.is_connected():
+             logger.warning("User client still connected in finally block, attempting disconnect.")
+             await user_client.disconnect()
+         logger.info("Bot stopped gracefully")
 
 if __name__ == '__main__':
     try:
@@ -853,7 +839,7 @@ if __name__ == '__main__':
         # Set up signal handlers
         # signals_to_handle = (signal.SIGTERM, signal.SIGINT)
         # for s in signals_to_handle:
-        #     loop.add_signal_handler(
+        #     loop.add_signal_handler(\
         #         s, lambda s=s: asyncio.create_task(shutdown(s, loop))
         #     )
         
